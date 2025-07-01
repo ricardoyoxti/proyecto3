@@ -1,9 +1,6 @@
 #!/bin/bash
 set -e
 
-# Redirigir salida a log para debugging
-exec > >(tee /var/log/startup-script.log | logger -t startup-script -s 2>/dev/console) 2>&1
-
 # Colores para logs
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -60,7 +57,7 @@ sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_
 
 # Crear usuario del sistema Odoo
 log "👤 Creando usuario del sistema Odoo..."
-adduser --system --quiet --home=$ODOO_HOME --group $ODOO_USER || true
+adduser --system --quiet --home=$ODOO_HOME --group $ODOO_USER
 
 # Instalar wkhtmltopdf
 log "📄 Instalando wkhtmltopdf..."
@@ -78,12 +75,6 @@ log "📥 Clonando Odoo $ODOO_VERSION..."
 git clone https://github.com/odoo/odoo --depth 1 --branch $ODOO_VERSION $ODOO_HOME
 chown -R $ODOO_USER:$ODOO_USER $ODOO_HOME
 
-# Validar odoo-bin
-if [ ! -f "$ODOO_HOME/odoo-bin" ]; then
-  error "No se encontró odoo-bin en $ODOO_HOME"
-  exit 1
-fi
-
 # Crear entorno virtual
 log "🐍 Creando entorno virtual Python..."
 python3 -m venv $ODOO_HOME/venv
@@ -92,11 +83,8 @@ chown -R $ODOO_USER:$ODOO_USER $ODOO_HOME/venv
 # Instalar dependencias de Python
 log "📦 Instalando dependencias Python..."
 sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install --upgrade pip
-if [ -f "$ODOO_HOME/requirements.txt" ]; then
-    sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install -r $ODOO_HOME/requirements.txt
-else
-    sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install -r $ODOO_HOME/odoo/requirements.txt
-fi
+sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install -r $ODOO_HOME/requirements.txt || \
+sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install -r $ODOO_HOME/odoo/requirements.txt
 sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install psycopg2-binary
 
 # Crear configuración y logs
