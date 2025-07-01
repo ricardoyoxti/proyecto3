@@ -1,152 +1,226 @@
 #!/bin/bash
 set -e
 
-# Colores para logs
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# Escribir logs de progreso para monitoreo
+exec > >(tee -a /var/log/startup-script.log)
+exec 2>&1
 
-log()     { echo -e "${GREEN}[$(date +'%F %T')] $1${NC}"; }
-error()   { echo -e "${RED}[$(date +'%F %T')] ERROR: $1${NC}"; }
-info()    { echo -e "${BLUE}[$(date +'%F %T')] INFO: $1${NC}"; }
+echo "========================================="
+echo "Iniciando instalación de Odoo 18 Community"
+echo "Fecha: $(date)"
+echo "========================================="
+# Actualizar el sistema
+apt-get update
+apt-get upgrade -y
 
-# ➕ Obtener metadatos desde GCP
-INSTANCE_NAME=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance-name" -H "Metadata-Flavor: Google" || echo "odoo-instance")
-DEPLOYMENT_TIME=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/deployment-time" -H "Metadata-Flavor: Google" || date -u +"%Y-%m-%dT%H:%M:%SZ")
-GITHUB_ACTOR=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-actor" -H "Metadata-Flavor: Google" || echo "unknown")
-
-# Variables
-ODOO_VERSION="18.0"
-ODOO_USER="odoo"
-ODOO_HOME="/opt/odoo"
-ODOO_CONFIG="/etc/odoo/odoo.conf"
-ODOO_PORT="8069"
-POSTGRES_USER="odoo"
-POSTGRES_DB="odoo"
-POSTGRES_PASSWORD="odoo123"
-
-log "🚀 Iniciando instalación de Odoo 18 Community"
-info "📋 Instancia: $INSTANCE_NAME"
-info "📅 Despliegue: $DEPLOYMENT_TIME"
-info "👤 GitHub actor: $GITHUB_ACTOR"
-
-# Actualización del sistema
-log "📦 Actualizando sistema..."
-apt-get update -y && apt-get upgrade -y
-
-# Instalar dependencias
-log "🔧 Instalando dependencias del sistema..."
-apt-get install -y wget git curl unzip python3 python3-venv python3-pip python3-dev \
-    libxml2-dev libxslt1-dev libevent-dev libsasl2-dev libldap2-dev libpq-dev \
-    libjpeg-dev libpng-dev libfreetype6-dev liblcms2-dev libwebp-dev libharfbuzz-dev \
-    libfribidi-dev libxcb1-dev libfontconfig1 xfonts-base xfonts-75dpi gcc g++ make
-
-# Instalar PostgreSQL
-log "🐘 Instalando PostgreSQL..."
-apt-get install -y postgresql postgresql-contrib postgresql-server-dev-all
-systemctl enable postgresql
-systemctl start postgresql
-
-# Crear usuario y base de datos en PostgreSQL
-sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname = '$POSTGRES_USER'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE USER $POSTGRES_USER WITH CREATEDB PASSWORD '$POSTGRES_PASSWORD';"
-sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1 || \
-    sudo -u postgres createdb -O $POSTGRES_USER $POSTGRES_DB
-
-# Crear usuario del sistema Odoo
-log "👤 Creando usuario del sistema Odoo..."
-adduser --system --quiet --home=$ODOO_HOME --group $ODOO_USER
+# Instalar dependencias del sistema
+apt-get install -y \
+    wget \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    git \
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3-venv \
+    build-essential \
+    libxml2-dev \
+    libxslt1-dev \
+    libevent-dev \
+    libsasl2-dev \
+    libldap2-dev \
+    libpq-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libfreetype6-dev \
+    zlib1g-dev \
+    libssl-dev \
+    libffi-dev \
+    node-less \
+    npm \
+    fontconfig \
+    xfonts-75dpi \
+    xfonts-base
 
 # Instalar wkhtmltopdf
-log "📄 Instalando wkhtmltopdf..."
 cd /tmp
-if [[ $(lsb_release -rs) == "22.04" ]]; then
-    wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-    dpkg -i wkhtmltox_0.12.6.1-2.jammy_amd64.deb || apt-get install -f -y
-else
-    wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.focal_amd64.deb
-    dpkg -i wkhtmltox_0.12.6.1-2.focal_amd64.deb || apt-get install -f -y
-fi
+wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
+apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb
 
-# Clonar Odoo
-log "📥 Clonando Odoo $ODOO_VERSION..."
-git clone https://github.com/odoo/odoo --depth 1 --branch $ODOO_VERSION $ODOO_HOME
-chown -R $ODOO_USER:$ODOO_USER $ODOO_HOME
+# Instalar PostgreSQL
+apt-get install -y postgresql postgresql-contrib
 
-# Crear entorno virtual
-log "🐍 Creando entorno virtual Python..."
-python3 -m venv $ODOO_HOME/venv
-chown -R $ODOO_USER:$ODOO_USER $ODOO_HOME/venv
+# Configurar PostgreSQL
+systemctl start postgresql
+systemctl enable postgresql
 
-# Instalar dependencias de Python
-log "📦 Instalando dependencias Python..."
-sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install --upgrade pip
-sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install -r $ODOO_HOME/requirements.txt || \
-sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install -r $ODOO_HOME/odoo/requirements.txt
-sudo -u $ODOO_USER $ODOO_HOME/venv/bin/pip install psycopg2-binary
+# Crear usuario de PostgreSQL para Odoo
+sudo -u postgres createuser -s odoo
+sudo -u postgres psql -c "ALTER USER odoo PASSWORD 'odoo';"
 
-# Crear configuración y logs
-log "⚙️ Configurando Odoo..."
-mkdir -p /etc/odoo /var/log/odoo /var/lib/odoo
-chown -R $ODOO_USER:$ODOO_USER /var/log/odoo /var/lib/odoo
+# Crear usuario del sistema para Odoo
+useradd -m -d /opt/odoo -U -r -s /bin/bash odoo
 
-cat > $ODOO_CONFIG << EOF
+# Crear directorio para Odoo
+mkdir -p /opt/odoo
+chown odoo:odoo /opt/odoo
+
+# Cambiar al usuario odoo para las siguientes operaciones
+sudo -u odoo bash << 'EOF'
+cd /opt/odoo
+
+# Crear entorno virtual de Python
+python3 -m venv odoo-venv
+source odoo-venv/bin/activate
+
+# Actualizar pip
+pip install --upgrade pip
+
+# Clonar Odoo 18 desde GitHub
+git clone https://www.github.com/odoo/odoo --depth 1 --branch 18.0 --single-branch .
+
+# Instalar dependencias de Python para Odoo 18
+pip install -r requirements.txt
+
+# Instalar dependencias adicionales comunes
+pip install \
+    psycopg2-binary \
+    babel \
+    decorator \
+    docutils \
+    ebaysdk \
+    feedparser \
+    gevent \
+    greenlet \
+    idna \
+    jinja2 \
+    libsass \
+    lxml \
+    markupsafe \
+    num2words \
+    ofxparse \
+    passlib \
+    pillow \
+    polib \
+    psutil \
+    pydot \
+    pyopenssl \
+    pypdf2 \
+    pyserial \
+    python-dateutil \
+    pytz \
+    pyusb \
+    qrcode \
+    reportlab \
+    requests \
+    urllib3 \
+    vobject \
+    werkzeug \
+    xlrd \
+    xlsxwriter \
+    xlwt \
+    zeep
+
+EOF
+
+# Crear directorio de configuración
+mkdir -p /etc/odoo
+mkdir -p /var/log/odoo
+
+# Crear archivo de configuración de Odoo
+cat > /etc/odoo/odoo.conf << 'EOF'
 [options]
 admin_passwd = admin
 db_host = localhost
 db_port = 5432
-db_user = $POSTGRES_USER
-db_password = $POSTGRES_PASSWORD
-addons_path = $ODOO_HOME/addons
+db_user = odoo
+db_password = odoo
+addons_path = /opt/odoo/addons
 logfile = /var/log/odoo/odoo.log
 log_level = info
-xmlrpc_port = $ODOO_PORT
+xmlrpc_port = 8069
+workers = 2
+max_cron_threads = 1
 EOF
 
-chown $ODOO_USER:$ODOO_USER $ODOO_CONFIG
+# Configurar permisos
+chown odoo:odoo /etc/odoo/odoo.conf
+chmod 640 /etc/odoo/odoo.conf
+chown -R odoo:odoo /var/log/odoo
 
-# Crear servicio systemd
-log "🔧 Creando servicio systemd para Odoo..."
-cat > /etc/systemd/system/odoo.service << EOF
+# Crear servicio systemd para Odoo
+cat > /etc/systemd/system/odoo.service << 'EOF'
 [Unit]
 Description=Odoo 18 Community
+Documentation=http://www.odoo.com
 After=network.target postgresql.service
-Requires=postgresql.service
 
 [Service]
 Type=simple
-User=$ODOO_USER
-Group=$ODOO_USER
-ExecStart=$ODOO_HOME/venv/bin/python3 $ODOO_HOME/odoo-bin -c $ODOO_CONFIG
+SyslogIdentifier=odoo
+PermissionsStartOnly=true
+User=odoo
+Group=odoo
+ExecStart=/opt/odoo/odoo-venv/bin/python /opt/odoo/odoo-bin -c /etc/odoo/odoo.conf
 StandardOutput=journal+console
 Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Habilitar e iniciar Odoo
-log "🚀 Iniciando servicio Odoo..."
-systemctl daemon-reexec
+# Recargar systemd y habilitar el servicio
 systemctl daemon-reload
 systemctl enable odoo
 systemctl start odoo
 
-# Inicializar base de datos
-log "🗄️ Verificando o creando base de datos..."
-sleep 10
-sudo -u $ODOO_USER $ODOO_HOME/venv/bin/python3 $ODOO_HOME/odoo-bin -c $ODOO_CONFIG -d $POSTGRES_DB --init=base --stop-after-init || \
-log "⚠️ La base de datos ya existe o no fue necesaria la inicialización."
+# El firewall se configura desde el workflow de GitHub Actions
+# No es necesario configurar ufw aquí
 
-# Mostrar IP pública
-EXTERNAL_IP=$(curl -s http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip -H "Metadata-Flavor: Google")
-log "🎉 Odoo está disponible en: http://$EXTERNAL_IP:$ODOO_PORT"
+# Obtener metadatos de la instancia desde GCP
+INSTANCE_NAME=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance-name" -H "Metadata-Flavor: Google" || echo "odoo-instance")
+DEPLOYMENT_TIME=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/deployment-time" -H "Metadata-Flavor: Google" || date)
+GITHUB_ACTOR=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-actor" -H "Metadata-Flavor: Google" || echo "unknown")
+EXTERNAL_IP=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" -H "Metadata-Flavor: Google")
 
-info "📊 Información de instalación:"
-info "   - Instancia: $INSTANCE_NAME"
-info "   - Fecha: $DEPLOYMENT_TIME"
-info "   - GitHub Actor: $GITHUB_ACTOR"
-info "   - Usuario Odoo: admin"
-info "   - Contraseña: admin"
+echo "========================================"
+echo "Instalación de Odoo 18 Community completada"
+echo "========================================"
+echo "Instancia: $INSTANCE_NAME"
+echo "URL de acceso: http://$EXTERNAL_IP:8069"
+echo "Usuario administrador: admin"
+echo "Contraseña maestra: admin"
+echo "Desplegado por: $GITHUB_ACTOR"
+echo "Fecha de despliegue: $DEPLOYMENT_TIME"
+echo "========================================"
+echo "PostgreSQL configurado con:"
+echo "Usuario: odoo"
+echo "Contraseña: odoo"
+echo "========================================"
+echo "Logs disponibles en: /var/log/odoo/odoo.log"
+echo "Configuración en: /etc/odoo/odoo.conf"
+echo "========================================"
+
+# Guardar información en un archivo
+cat > /opt/odoo/installation_info.txt << EOF
+Odoo 18 Community Installation Information
+==========================================
+Instance Name: $INSTANCE_NAME
+Installation Date: $DEPLOYMENT_TIME
+Deployed by: $GITHUB_ACTOR
+External IP: $EXTERNAL_IP
+Odoo Directory: /opt/odoo
+Configuration File: /etc/odoo/odoo.conf
+Log File: /var/log/odoo/odoo.log
+Service Name: odoo
+URL: http://$EXTERNAL_IP:8069
+Master Password: admin
+Database User: odoo
+Database Password: odoo
+==========================================
+EOF
+
+echo "Información de instalación guardada en /opt/odoo/installation_info.txt"
