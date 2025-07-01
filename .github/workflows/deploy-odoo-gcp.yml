@@ -1,0 +1,232 @@
+name: Deploy Odoo 18 to Google Cloud Platform
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: 'Tipo de instancia de GCP'
+        required: false
+        default: 'e2-medium'
+        type: choice
+        options:
+          - e2-micro
+          - e2-small
+          - e2-medium
+          - e2-standard-2
+          - e2-standard-4
+      zone:
+        description: 'Zona de GCP'
+        required: false
+        default: 'us-central1-a'
+        type: choice
+        options:
+          - us-central1-a
+          - us-central1-b
+          - us-central1-c
+          - us-east1-a
+          - us-east1-b
+          - us-west1-a
+          - us-west1-b
+          - europe-west1-a
+          - europe-west1-b
+          - asia-southeast1-a
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  ZONE: ${{ github.event.inputs.zone || 'us-central1-a' }}
+  MACHINE_TYPE: ${{ github.event.inputs.instance_type || 'e2-medium' }}
+
+jobs:
+  deploy:
+    name: Deploy Odoo to GCP
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        export_default_credentials: true
+
+    - name: Generate unique instance name
+      id: instance_name
+      run: |
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        RANDOM_ID=$(openssl rand -hex 4)
+        INSTANCE_NAME="odoo18-${TIMESTAMP}-${RANDOM_ID}"
+        echo "INSTANCE_NAME=${INSTANCE_NAME}" >> $GITHUB_OUTPUT
+        echo "Generated instance name: ${INSTANCE_NAME}"
+
+    - name: Create firewall rules (if not exists)
+      run: |
+        # Regla para HTTP (puerto 8069 - Odoo)
+        if ! gcloud compute firewall-rules describe allow-odoo-http --quiet 2>/dev/null; then
+          gcloud compute firewall-rules create allow-odoo-http \
+            --allow tcp:8069 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow HTTP traffic for Odoo on port 8069" \
+            --target-tags odoo-server
+        fi
+        
+        # Regla para SSH (puerto 22)
+        if ! gcloud compute firewall-rules describe allow-ssh --quiet 2>/dev/null; then
+          gcloud compute firewall-rules create allow-ssh \
+            --allow tcp:22 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow SSH access" \
+            --target-tags odoo-server
+        fi
+
+    - name: Create VM instance
+      run: |
+        gcloud compute instances create ${{ steps.instance_name.outputs.INSTANCE_NAME }} \
+          --zone=${{ env.ZONE }} \
+          --machine-type=${{ env.MACHINE_TYPE }} \
+          --network-tier=PREMIUM \
+          --maintenance-policy=MIGRATE \
+          --provisioning-model=STANDARD \
+          --tags=odoo-server \
+          --image-family=ubuntu-2204-lts \
+          --image-project=ubuntu-os-cloud \
+          --boot-disk-size=20GB \
+          --boot-disk-type=pd-standard \
+          --boot-disk-device-name=${{ steps.instance_name.outputs.INSTANCE_NAME }} \
+          --metadata-from-file startup-script=startup-script.sh
+
+    - name: Wait for instance to be ready
+      run: |
+        echo "Esperando que la instancia esté lista..."
+        sleep 30
+        
+        # Esperar hasta que la instancia esté corriendo
+        while true; do
+          STATUS=$(gcloud compute instances describe ${{ steps.instance_name.outputs.INSTANCE_NAME }} \
+            --zone=${{ env.ZONE }} \
+            --format="value(status)")
+          
+          if [ "$STATUS" = "RUNNING" ]; then
+            echo "Instancia está corriendo"
+            break
+          fi
+          
+          echo "Estado actual: $STATUS. Esperando..."
+          sleep 10
+        done
+
+    - name: Get instance details
+      id: instance_details
+      run: |
+        EXTERNAL_IP=$(gcloud compute instances describe ${{ steps.instance_name.outputs.INSTANCE_NAME }} \
+          --zone=${{ env.ZONE }} \
+          --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+        
+        INTERNAL_IP=$(gcloud compute instances describe ${{ steps.instance_name.outputs.INSTANCE_NAME }} \
+          --zone=${{ env.ZONE }} \
+          --format="value(networkInterfaces[0].networkIP)")
+        
+        echo "EXTERNAL_IP=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+        echo "INTERNAL_IP=${INTERNAL_IP}" >> $GITHUB_OUTPUT
+        
+        echo "Instance Name: ${{ steps.instance_name.outputs.INSTANCE_NAME }}"
+        echo "External IP: ${EXTERNAL_IP}"
+        echo "Internal IP: ${INTERNAL_IP}"
+        echo "Zone: ${{ env.ZONE }}"
+
+    - name: Wait for Odoo installation to complete
+      run: |
+        echo "Esperando que Odoo se instale completamente..."
+        EXTERNAL_IP="${{ steps.instance_details.outputs.EXTERNAL_IP }}"
+        
+        # Esperar hasta 15 minutos para que Odoo esté listo
+        for i in {1..90}; do
+          echo "Intento $i/90: Verificando si Odoo está disponible..."
+          
+          if curl -s --connect-timeout 10 --max-time 30 "http://${EXTERNAL_IP}:8069" > /dev/null 2>&1; then
+            echo "✅ Odoo está disponible!"
+            break
+          fi
+          
+          if [ $i -eq 90 ]; then
+            echo "⚠️ Timeout: Odoo puede estar aún instalándose. Verifica manualmente."
+            break
+          fi
+          
+          sleep 10
+        done
+
+    - name: Display deployment information
+      run: |
+        echo "🚀 ¡Despliegue completado exitosamente!"
+        echo ""
+        echo "📋 INFORMACIÓN DE LA INSTANCIA:"
+        echo "================================"
+        echo "Nombre de la instancia: ${{ steps.instance_name.outputs.INSTANCE_NAME }}"
+        echo "Zona: ${{ env.ZONE }}"
+        echo "Tipo de máquina: ${{ env.MACHINE_TYPE }}"
+        echo "IP Externa: ${{ steps.instance_details.outputs.EXTERNAL_IP }}"
+        echo "IP Interna: ${{ steps.instance_details.outputs.INTERNAL_IP }}"
+        echo ""
+        echo "🌐 ACCESO A ODOO:"
+        echo "================"
+        echo "URL: http://${{ steps.instance_details.outputs.EXTERNAL_IP }}:8069"
+        echo ""
+        echo "📝 CREDENCIALES INICIALES:"
+        echo "========================="
+        echo "Base de datos: odoo"
+        echo "Usuario: admin"
+        echo "Contraseña: admin"
+        echo ""
+        echo "🔧 GESTIÓN DE LA INSTANCIA:"
+        echo "==========================="
+        echo "Para conectarse por SSH:"
+        echo "gcloud compute ssh ${{ steps.instance_name.outputs.INSTANCE_NAME }} --zone=${{ env.ZONE }}"
+        echo ""
+        echo "Para detener la instancia:"
+        echo "gcloud compute instances stop ${{ steps.instance_name.outputs.INSTANCE_NAME }} --zone=${{ env.ZONE }}"
+        echo ""
+        echo "Para eliminar la instancia:"
+        echo "gcloud compute instances delete ${{ steps.instance_name.outputs.INSTANCE_NAME }} --zone=${{ env.ZONE }}"
+
+    - name: Create deployment summary
+      run: |
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        # 🚀 Odoo 18 Deployment Summary
+        
+        ## Instance Details
+        | Property | Value |
+        |----------|-------|
+        | **Instance Name** | \`${{ steps.instance_name.outputs.INSTANCE_NAME }}\` |
+        | **Zone** | \`${{ env.ZONE }}\` |
+        | **Machine Type** | \`${{ env.MACHINE_TYPE }}\` |
+        | **External IP** | \`${{ steps.instance_details.outputs.EXTERNAL_IP }}\` |
+        
+        ## 🌐 Access Information
+        
+        **Odoo URL:** [http://${{ steps.instance_details.outputs.EXTERNAL_IP }}:8069](http://${{ steps.instance_details.outputs.EXTERNAL_IP }}:8069)
+        
+        **Initial Credentials:**
+        - Database: \`odoo\`
+        - Username: \`admin\`
+        - Password: \`admin\`
+        
+        ## 🔧 Management Commands
+        
+        **SSH Access:**
+        \`\`\`bash
+        gcloud compute ssh ${{ steps.instance_name.outputs.INSTANCE_NAME }} --zone=${{ env.ZONE }}
+        \`\`\`
+        
+        **Stop Instance:**
+        \`\`\`bash
+        gcloud compute instances stop ${{ steps.instance_name.outputs.INSTANCE_NAME }} --zone=${{ env.ZONE }}
+        \`\`\`
+        
+        **Delete Instance:**
+        \`\`\`bash
+        gcloud compute instances delete ${{ steps.instance_name.outputs.INSTANCE_NAME }} --zone=${{ env.ZONE }}
+        \`\`\`
+        EOF
