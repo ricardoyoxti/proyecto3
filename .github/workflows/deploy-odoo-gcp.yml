@@ -22,7 +22,7 @@ on:
       zone:
         description: 'Zona de GCP'
         required: true
-        default: 'southamerica-west1-b'
+        default: 'us-central1-a'
       disk_size:
         description: 'Tamaño del disco (GB)'
         required: true
