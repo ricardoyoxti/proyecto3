@@ -456,8 +456,7 @@ jobs:
                   --shielded-integrity-monitoring \
                   --labels=environment=production,application=odoo,created-by=github-actions \
                   --reservation-affinity=any \
-                  --metadata startup-script="$STARTUP_SCRIPT" \
-                  --metadata instance-name=$INSTANCE_NAME,deployment-time=$(date -u +"%Y-%m-%dT%H:%M:%SZ"),github-actor=${{ github.actor }}
+                  --metadata "startup-script=$STARTUP_SCRIPT,instance-name=$INSTANCE_NAME,deployment-time=$(date -u +"%Y-%m-%dT%H:%M:%SZ"),github-actor=${{ github.actor }}"
 
             - name: 🔥 Create firewall rules
               run: |
