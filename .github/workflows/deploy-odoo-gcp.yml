@@ -503,7 +503,7 @@ jobs:
         else
             echo "ERROR: La función main no está definida"
             exit 1
-        fi"
+        fi
         '
         echo "🏗️ Creando instancia: $INSTANCE_NAME"
         gcloud compute instances create $INSTANCE_NAME \
