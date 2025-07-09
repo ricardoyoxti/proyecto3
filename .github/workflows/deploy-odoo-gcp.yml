@@ -23,6 +23,7 @@ on:
         description: 'Zona de GCP'
         required: true
         default: 'us-central1-a'
+        type: choice
         options:
         - 'southamerica-west1-a'
         - 'us-central1-a'
