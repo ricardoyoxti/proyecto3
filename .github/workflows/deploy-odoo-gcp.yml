@@ -497,7 +497,13 @@ jobs:
         }
 
         # Ejecutar función principal
-        main "$@"
+        echo "Ejecutando función principal main con argumentos: $@"
+        if declare -f main > /dev/null; then
+            main "$@"
+        else
+            echo "ERROR: La función main no está definida"
+            exit 1
+        fi"
         '
         echo "🏗️ Creando instancia: $INSTANCE_NAME"
         gcloud compute instances create $INSTANCE_NAME \
