@@ -73,12 +73,13 @@ jobs:
       run: |
         INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
         
-        STARTUP_SCRIPT='#!/bin/bash
+        # Crear script de instalación con nombre corto
+        cat > /tmp/install_odoo.sh << 'SCRIPT_EOF'
+        #!/bin/bash
 
         # Script de instalación de Odoo 18 Community con PostgreSQL
         # Compatible con Ubuntu 20.04/22.04 y Debian 11/12
         # Autor: Script de instalación automatizada
-        # Fecha: $(date +%Y-%m-%d)
 
         set -e  # Salir si hay algún error
 
@@ -98,7 +99,7 @@ jobs:
         print_step() {
             echo "[STEP] $1"
         }
-        
+
         # Configuración por defecto
         ODOO_USER="odoo"
         ODOO_HOME="/opt/odoo"
@@ -359,75 +360,6 @@ jobs:
             fi
         }
 
-        # Función para instalar nginx (opcional)
-        install_nginx() {
-            read -p "¿Deseas instalar y configurar Nginx como proxy reverso? (y/n): " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                print_step "Instalando y configurando Nginx..."
-                
-                apt install -y nginx
-                
-                cat > /etc/nginx/sites-available/odoo << EOF
-        upstream odoo {
-            server 127.0.0.1:$ODOO_PORT;
-        }
-
-        upstream odoochat {
-            server 127.0.0.1:$ODOO_LONGPOLL_PORT;
-        }
-
-        server {
-            listen 80;
-            server_name _;
-            
-            access_log /var/log/nginx/odoo.access.log;
-            error_log /var/log/nginx/odoo.error.log;
-            
-            proxy_read_timeout 720s;
-            proxy_connect_timeout 720s;
-            proxy_send_timeout 720s;
-            
-            proxy_set_header X-Forwarded-Host \$host;
-            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto \$scheme;
-            proxy_set_header X-Real-IP \$remote_addr;
-            
-            location / {
-                proxy_redirect off;
-                proxy_pass http://odoo;
-            }
-            
-            location /longpolling {
-                proxy_pass http://odoochat;
-            }
-            
-            location ~* /web/static/ {
-                proxy_cache_valid 200 60m;
-                proxy_buffering on;
-                expires 864000;
-                proxy_pass http://odoo;
-            }
-            
-            gzip on;
-            gzip_min_length 1100;
-            gzip_buffers 4 32k;
-            gzip_types text/plain application/x-javascript text/xml text/css;
-            gzip_vary on;
-        }
-        EOF
-                
-                ln -sf /etc/nginx/sites-available/odoo /etc/nginx/sites-enabled/
-                rm -f /etc/nginx/sites-enabled/default
-                
-                nginx -t
-                systemctl restart nginx
-                systemctl enable nginx
-                
-                print_message "Nginx configurado como proxy reverso"
-            fi
-        }
-
         # Función para mostrar información final
         show_final_info() {
             print_step "Información de la instalación:"
@@ -475,7 +407,6 @@ jobs:
             create_odoo_config
             create_systemd_service
             configure_firewall
-            install_nginx
             
             # Iniciar Odoo
             print_step "Iniciando servicio Odoo..."
@@ -489,6 +420,7 @@ jobs:
                 print_message "Odoo iniciado correctamente"
             else
                 print_error "Error al iniciar Odoo. Revisa los logs con: journalctl -u odoo -f"
+                exit 1
             fi
             
             show_final_info
@@ -497,111 +429,109 @@ jobs:
         }
 
         # Ejecutar función principal
-        echo "Ejecutando función principal main con argumentos: $@"
-        if declare -f main > /dev/null; then
-            main "$@"
-        else
-            echo "ERROR: La función main no está definida"
-            exit 1
-        fi
-        '
-        echo "🏗️ Creando instancia: $INSTANCE_NAME"
-        gcloud compute instances create $INSTANCE_NAME \
-          --project=${{ env.PROJECT_ID }} \
-          --zone=${{ github.event.inputs.zone }} \
-          --machine-type=${{ github.event.inputs.machine_type }} \
-          --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default \
-          --maintenance-policy=MIGRATE \
-          --provisioning-model=STANDARD \
-          --service-account=${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }} \
-          --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/trace.append \
-          --tags=odoo-server,http-server,https-server \
-          --image-family=ubuntu-2204-lts \
-          --image-project=ubuntu-os-cloud \
-          --boot-disk-size=${{ github.event.inputs.disk_size }} \
-          --boot-disk-type=pd-balanced \
-          --boot-disk-device-name=$INSTANCE_NAME \
-          --no-shielded-secure-boot \
-          --shielded-vtpm \
-          --shielded-integrity-monitoring \
-          --labels=environment=production,application=odoo,created-by=github-actions \
-          --reservation-affinity=any \
-          --metadata startup-script="$STARTUP_SCRIPT" \
-          --metadata instance-name=$INSTANCE_NAME,deployment-time=$(date -u +"%Y-%m-%dT%H:%M:%SZ"),github-actor=${{ github.actor }}
+        main "$@"
+        SCRIPT_EOF
+                
+                # Leer el contenido del script y usarlo como startup-script
+                STARTUP_SCRIPT=$(cat /tmp/install_odoo.sh)
+                
+                echo "🏗️ Creando instancia: $INSTANCE_NAME"
+                gcloud compute instances create $INSTANCE_NAME \
+                  --project=${{ env.PROJECT_ID }} \
+                  --zone=${{ github.event.inputs.zone }} \
+                  --machine-type=${{ github.event.inputs.machine_type }} \
+                  --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default \
+                  --maintenance-policy=MIGRATE \
+                  --provisioning-model=STANDARD \
+                  --service-account=${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }} \
+                  --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/trace.append \
+                  --tags=odoo-server,http-server,https-server \
+                  --image-family=ubuntu-2204-lts \
+                  --image-project=ubuntu-os-cloud \
+                  --boot-disk-size=${{ github.event.inputs.disk_size }} \
+                  --boot-disk-type=pd-balanced \
+                  --boot-disk-device-name=$INSTANCE_NAME \
+                  --no-shielded-secure-boot \
+                  --shielded-vtpm \
+                  --shielded-integrity-monitoring \
+                  --labels=environment=production,application=odoo,created-by=github-actions \
+                  --reservation-affinity=any \
+                  --metadata startup-script="$STARTUP_SCRIPT" \
+                  --metadata instance-name=$INSTANCE_NAME,deployment-time=$(date -u +"%Y-%m-%dT%H:%M:%SZ"),github-actor=${{ github.actor }}
 
-    - name: 🔥 Create firewall rules
-      run: |
-        # Regla para Odoo (puerto 8069)
-        gcloud compute firewall-rules create allow-odoo-${{ github.run_number }} \
-          --project=${{ env.PROJECT_ID }} \
-          --direction=INGRESS \
-          --priority=1000 \
-          --network=default \
-          --action=ALLOW \
-          --rules=tcp:8069 \
-          --source-ranges=0.0.0.0/0 \
-          --target-tags=odoo-server \
-          --description="Allow Odoo access on port 8069" || \
-        gcloud compute firewall-rules create allow-odoo \
-          --project=${{ env.PROJECT_ID }} \
-          --direction=INGRESS \
-          --priority=1000 \
-          --network=default \
-          --action=ALLOW \
-          --rules=tcp:8069 \
-          --source-ranges=0.0.0.0/0 \
-          --target-tags=odoo-server \
-          --description="Allow Odoo access on port 8069" || echo "Firewall rule already exists"
-        
-        # Regla para SSH (si no existe)
-        gcloud compute firewall-rules create allow-ssh \
-          --project=${{ env.PROJECT_ID }} \
-          --direction=INGRESS \
-          --priority=1000 \
-          --network=default \
-          --action=ALLOW \
-          --rules=tcp:22 \
-          --source-ranges=0.0.0.0/0 \
-          --target-tags=odoo-server \
-          --description="Allow SSH access" || echo "SSH firewall rule already exists"
+            - name: 🔥 Create firewall rules
+              run: |
+                # Regla para Odoo (puerto 8069)
+                gcloud compute firewall-rules create allow-odoo-${{ github.run_number }} \
+                  --project=${{ env.PROJECT_ID }} \
+                  --direction=INGRESS \
+                  --priority=1000 \
+                  --network=default \
+                  --action=ALLOW \
+                  --rules=tcp:8069 \
+                  --source-ranges=0.0.0.0/0 \
+                  --target-tags=odoo-server \
+                  --description="Allow Odoo access on port 8069" || \
+                gcloud compute firewall-rules create allow-odoo \
+                  --project=${{ env.PROJECT_ID }} \
+                  --direction=INGRESS \
+                  --priority=1000 \
+                  --network=default \
+                  --action=ALLOW \
+                  --rules=tcp:8069 \
+                  --source-ranges=0.0.0.0/0 \
+                  --target-tags=odoo-server \
+                  --description="Allow Odoo access on port 8069" || echo "Firewall rule already exists"
+                
+                # Regla para SSH (si no existe)
+                gcloud compute firewall-rules create allow-ssh \
+                  --project=${{ env.PROJECT_ID }} \
+                  --direction=INGRESS \
+                  --priority=1000 \
+                  --network=default \
+                  --action=ALLOW \
+                  --rules=tcp:22 \
+                  --source-ranges=0.0.0.0/0 \
+                  --target-tags=odoo-server \
+                  --description="Allow SSH access" || echo "SSH firewall rule already exists"
 
-    - name: 📊 Get instance details
-      run: |
-        INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
-        echo "🎉 Instancia creada exitosamente!"
-        echo "📍 Detalles de la instancia:"
-        gcloud compute instances describe $INSTANCE_NAME \
-          --zone=${{ github.event.inputs.zone }} \
-          --format="table(name,status,machineType.basename(),scheduling.preemptible.yesno(yes='Yes',no='No'):label=PREEMPTIBLE,networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP,disks[0].diskSizeGb)"
-        
-        echo ""
-        echo "🌐 IP Externa:"
-        EXTERNAL_IP=$(gcloud compute instances describe $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
-        echo "IP: $EXTERNAL_IP"
-        
-        echo ""
-        echo "🏷️ Información del despliegue:"
-        echo "Nombre generado: $INSTANCE_NAME"
-        echo "Nombre base: ${{ steps.generate_name.outputs.BASE_NAME }}"
-        echo "Desplegado por: ${{ github.actor }}"
-        echo "Fecha: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-        
-        echo ""
-        echo "🔗 URLs de acceso:"
-        echo "Odoo: http://$EXTERNAL_IP:8069"
-        echo "SSH: gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }}"
-        
-        echo ""
-        echo "⏳ La instalación de Odoo puede tardar entre 5-10 minutos después de que la instancia esté ejecutándose."
-        echo "📋 Credenciales por defecto:"
-        echo "  - Database: odoo"
-        echo "  - User: admin"
-        echo "  - Password: admin"
-        
-        echo ""
-        echo "🗑️ Para eliminar la instancia:"
-        echo "gcloud compute instances delete $INSTANCE_NAME --zone=${{ github.event.inputs.zone }}"
-        
-        echo ""
-        echo "📋 Para verificar el progreso de la instalación:"
-        echo "gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command='tail -f /var/log/startup.log'"
+            - name: 📊 Get instance details
+              run: |
+                INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
+                echo "🎉 Instancia creada exitosamente!"
+                echo "📍 Detalles de la instancia:"
+                gcloud compute instances describe $INSTANCE_NAME \
+                  --zone=${{ github.event.inputs.zone }} \
+                  --format="table(name,status,machineType.basename(),scheduling.preemptible.yesno(yes='Yes',no='No'):label=PREEMPTIBLE,networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP,disks[0].diskSizeGb)"
+                
+                echo ""
+                echo "🌐 IP Externa:"
+                EXTERNAL_IP=$(gcloud compute instances describe $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
+                echo "IP: $EXTERNAL_IP"
+                
+                echo ""
+                echo "🏷️ Información del despliegue:"
+                echo "Nombre generado: $INSTANCE_NAME"
+                echo "Nombre base: ${{ steps.generate_name.outputs.BASE_NAME }}"
+                echo "Desplegado por: ${{ github.actor }}"
+                echo "Fecha: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+                
+                echo ""
+                echo "🔗 URLs de acceso:"
+                echo "Odoo: http://$EXTERNAL_IP:8069"
+                echo "SSH: gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }}"
+                
+                echo ""
+                echo "⏳ La instalación de Odoo puede tardar entre 5-10 minutos después de que la instancia esté ejecutándose."
+                echo "📋 Credenciales por defecto:"
+                echo "  - Database: odoo"
+                echo "  - User: admin"
+                echo "  - Password: admin"
+                
+                echo ""
+                echo "🗑️ Para eliminar la instancia:"
+                echo "gcloud compute instances delete $INSTANCE_NAME --zone=${{ github.event.inputs.zone }}"
+                
+                echo ""
+                echo "📋 Para verificar el progreso de la instalación:"
+                echo "gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command='tail -f /var/log/startup.log'"
