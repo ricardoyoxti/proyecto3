@@ -30,7 +30,11 @@ on:
       disk_size:
         description: 'Tamaño del disco (GB)'
         required: true
-        default: '10'
+        default: '20'
+      auto_delete:
+        description: 'Auto-eliminar instancia después de X horas (0 = no eliminar)'
+        required: false
+        default: '0'
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -69,11 +73,9 @@ jobs:
         echo "BASE_NAME=$BASE_NAME" >> $GITHUB_OUTPUT
         echo "🏗️ Nombre de instancia generado: $INSTANCE_NAME"
 
-    - name: 🖥️ Create VM Instance
+    - name: 📝 Create startup script
       run: |
-        INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
-        
-        # Crear script de instalación
+        # Crear script de instalación mejorado
         cat > /tmp/install_odoo.sh << 'SCRIPT_EOF'
         #!/bin/bash
 
@@ -83,21 +85,26 @@ jobs:
 
         set -e  # Salir si hay algún error
 
+        # Configurar logging
+        LOG_FILE="/var/log/odoo-install.log"
+        exec > >(tee -a $LOG_FILE)
+        exec 2>&1
+
         # Función para mostrar mensajes
         print_message() {
-            echo "[INFO] $1"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $1"
         }
 
         print_warning() {
-            echo "[WARNING] $1"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] $1"
         }
 
         print_error() {
-            echo "[ERROR] $1"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1"
         }
 
         print_step() {
-            echo "[STEP] $1"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP] $1"
         }
 
         # Configuración por defecto
@@ -135,14 +142,16 @@ jobs:
         # Función para actualizar el sistema
         update_system() {
             print_step "Actualizando el sistema..."
-            apt update && apt upgrade -y
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update && apt-get upgrade -y
             print_message "Sistema actualizado correctamente"
         }
 
         # Función para instalar dependencias básicas
         install_basic_dependencies() {
             print_step "Instalando dependencias básicas..."
-            apt install -y \
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y \
                 wget \
                 curl \
                 gnupg2 \
@@ -173,7 +182,8 @@ jobs:
                 xz-utils \
                 fontconfig \
                 libfontconfig1 \
-                wkhtmltopdf
+                wkhtmltopdf \
+                supervisor
             
             print_message "Dependencias básicas instaladas"
         }
@@ -186,8 +196,8 @@ jobs:
             curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg
             echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
             
-            apt update
-            apt install -y postgresql-$POSTGRESQL_VERSION postgresql-client-$POSTGRESQL_VERSION postgresql-contrib-$POSTGRESQL_VERSION
+            apt-get update
+            apt-get install -y postgresql-$POSTGRESQL_VERSION postgresql-client-$POSTGRESQL_VERSION postgresql-contrib-$POSTGRESQL_VERSION
             
             # Iniciar y habilitar PostgreSQL
             systemctl start postgresql
@@ -260,8 +270,7 @@ jobs:
             
             # Activar entorno virtual e instalar dependencias
             cd $ODOO_HOME/odoo
-            sudo -u $ODOO_USER bash -c "source $ODOO_HOME/odoo-venv/bin/activate && pip install --upgrade pip"
-            sudo -u $ODOO_USER bash -c "source $ODOO_HOME/odoo-venv/bin/activate && pip install wheel"
+            sudo -u $ODOO_USER bash -c "source $ODOO_HOME/odoo-venv/bin/activate && pip install --upgrade pip setuptools wheel"
             sudo -u $ODOO_USER bash -c "source $ODOO_HOME/odoo-venv/bin/activate && pip install -r requirements.txt"
             
             # Crear directorios necesarios
@@ -284,7 +293,7 @@ jobs:
             cat > $ODOO_CONFIG_FILE << EOF
         [options]
         ; This is the password that allows database operations:
-        admin_passwd = admin
+        admin_passwd = admin123
         db_host = localhost
         db_port = 5432
         db_user = $ODOO_USER
@@ -300,6 +309,7 @@ jobs:
         without_demo = True
         list_db = True
         proxy_mode = False
+        server_wide_modules = base,web
         EOF
             
             chown $ODOO_USER:$ODOO_USER $ODOO_CONFIG_FILE
@@ -330,6 +340,7 @@ jobs:
         Restart=always
         RestartSec=10
         KillMode=mixed
+        Environment=PATH=$ODOO_HOME/odoo-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
         [Install]
         WantedBy=multi-user.target
@@ -341,23 +352,74 @@ jobs:
             print_message "Servicio systemd creado y habilitado"
         }
 
+        # Función para configurar supervisor como alternativa
+        configure_supervisor() {
+            print_step "Configurando supervisor para Odoo..."
+            
+            cat > /etc/supervisor/conf.d/odoo.conf << EOF
+        [program:odoo]
+        command=$ODOO_HOME/odoo-venv/bin/python $ODOO_HOME/odoo/odoo-bin -c $ODOO_CONFIG_FILE
+        directory=$ODOO_HOME/odoo
+        user=$ODOO_USER
+        autostart=true
+        autorestart=true
+        stdout_logfile=$ODOO_LOG_DIR/odoo.log
+        stderr_logfile=$ODOO_LOG_DIR/odoo.log
+        environment=PATH="$ODOO_HOME/odoo-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        EOF
+            
+            systemctl restart supervisor
+            systemctl enable supervisor
+            
+            print_message "Supervisor configurado para Odoo"
+        }
+
         # Función para configurar firewall
         configure_firewall() {
-            print_step "Configurando firewall..."
+            print_step "Configurando firewall local..."
             
             if command -v ufw &> /dev/null; then
+                ufw --force enable
                 ufw allow $ODOO_PORT/tcp
                 ufw allow $ODOO_LONGPOLL_PORT/tcp
                 ufw allow ssh
                 print_message "Firewall configurado con ufw"
-            elif command -v firewall-cmd &> /dev/null; then
-                firewall-cmd --permanent --add-port=$ODOO_PORT/tcp
-                firewall-cmd --permanent --add-port=$ODOO_LONGPOLL_PORT/tcp
-                firewall-cmd --reload
-                print_message "Firewall configurado con firewall-cmd"
             else
-                print_warning "No se encontró firewall configurado"
+                print_warning "UFW no está disponible"
             fi
+        }
+
+        # Función para crear script de información
+        create_info_script() {
+            print_step "Creando script de información..."
+            
+            cat > /usr/local/bin/odoo-info << 'EOF'
+        #!/bin/bash
+        echo "==============================================="
+        echo "ODOO 18 COMMUNITY - INFORMACIÓN DEL SISTEMA"
+        echo "==============================================="
+        echo
+        echo "Estado del servicio:"
+        systemctl status odoo --no-pager -l
+        echo
+        echo "Últimos logs:"
+        journalctl -u odoo -n 10 --no-pager
+        echo
+        echo "Puertos abiertos:"
+        netstat -tlnp | grep -E ':(8069|8072|5432)'
+        echo
+        echo "Información de conexión:"
+        echo "  - IP Externa: $(curl -s http://checkip.amazonaws.com/ || echo 'No disponible')"
+        echo "  - URL Odoo: http://$(curl -s http://checkip.amazonaws.com/):8069"
+        echo "  - Usuario admin: admin"
+        echo "  - Contraseña master: admin123"
+        echo
+        echo "==============================================="
+        EOF
+            
+            chmod +x /usr/local/bin/odoo-info
+            
+            print_message "Script de información creado en /usr/local/bin/odoo-info"
         }
 
         # Función para mostrar información final
@@ -382,19 +444,57 @@ jobs:
             echo "  - Reiniciar Odoo: systemctl restart odoo"
             echo "  - Ver logs: journalctl -u odoo -f"
             echo "  - Ver estado: systemctl status odoo"
+            echo "  - Ver información: odoo-info"
             echo
             echo "Acceso web:"
-            echo "  - URL: http://$(hostname -I | awk '{print $1}'):$ODOO_PORT"
+            EXTERNAL_IP=$(curl -s http://checkip.amazonaws.com/ || echo "IP_NO_DISPONIBLE")
+            echo "  - URL: http://$EXTERNAL_IP:$ODOO_PORT"
             echo "  - Usuario admin: admin"
-            echo "  - Contraseña: (la que configures en la primera conexión)"
+            echo "  - Contraseña master: admin123"
             echo
             echo "==============================================="
             echo
+            
+            # Crear archivo de estado
+            echo "INSTALLATION_COMPLETE" > /tmp/odoo-install-status
+            echo "$(date): Instalación completada" >> /tmp/odoo-install-status
+            echo "URL: http://$EXTERNAL_IP:$ODOO_PORT" >> /tmp/odoo-install-status
+        }
+
+        # Función de verificación de salud
+        health_check() {
+            print_step "Verificando salud del sistema..."
+            
+            # Verificar PostgreSQL
+            if systemctl is-active --quiet postgresql; then
+                print_message "PostgreSQL está activo"
+            else
+                print_error "PostgreSQL no está activo"
+                return 1
+            fi
+            
+            # Verificar Odoo
+            if systemctl is-active --quiet odoo; then
+                print_message "Odoo está activo"
+            else
+                print_error "Odoo no está activo"
+                return 1
+            fi
+            
+            # Verificar puertos
+            if netstat -tlnp | grep -q ":$ODOO_PORT "; then
+                print_message "Puerto $ODOO_PORT está abierto"
+            else
+                print_warning "Puerto $ODOO_PORT no está abierto"
+            fi
+            
+            return 0
         }
 
         # Función principal
         main() {
             print_message "Iniciando instalación de Odoo 18 Community..."
+            print_message "Log de instalación: $LOG_FILE"
             
             detect_os
             check_root
@@ -406,31 +506,48 @@ jobs:
             install_odoo_from_source
             create_odoo_config
             create_systemd_service
+            configure_supervisor
             configure_firewall
+            create_info_script
             
             # Iniciar Odoo
             print_step "Iniciando servicio Odoo..."
             systemctl start odoo
             
             # Esperar un momento para que inicie
-            sleep 5
+            sleep 10
             
-            # Verificar estado
-            if systemctl is-active --quiet odoo; then
-                print_message "Odoo iniciado correctamente"
+            # Verificar salud
+            if health_check; then
+                print_message "Sistema verificado correctamente"
             else
-                print_error "Error al iniciar Odoo. Revisa los logs con: journalctl -u odoo -f"
-                exit 1
+                print_error "Error en la verificación del sistema"
             fi
             
             show_final_info
             
             print_message "¡Instalación completada! Odoo 18 Community está listo para usar."
+            print_message "Ejecuta 'odoo-info' para ver el estado del sistema"
         }
 
         # Ejecutar función principal
         main "$@"
         SCRIPT_EOF
+        
+        chmod +x /tmp/install_odoo.sh
+        
+        echo "📝 Script de instalación creado y listo para usar"
+        echo "📊 Contenido del script:"
+        echo "  - Instalación automatizada de Odoo 18"
+        echo "  - Configuración de PostgreSQL"
+        echo "  - Configuración de firewall"
+        echo "  - Logging detallado"
+        echo "  - Verificación de salud"
+        echo "  - Script de información del sistema"
+
+    - name: 🖥️ Create VM Instance
+      run: |
+        INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
         
         echo "🏗️ Creando instancia: $INSTANCE_NAME"
         gcloud compute instances create $INSTANCE_NAME \
@@ -454,7 +571,7 @@ jobs:
           --labels=environment=production,application=odoo,created-by=github-actions \
           --reservation-affinity=any \
           --metadata-from-file startup-script=/tmp/install_odoo.sh \
-          --metadata "instance-name=$INSTANCE_NAME,deployment-time=$(date -u +"%Y-%m-%dT%H:%M:%SZ"),github-actor=${{ github.actor }}"
+          --metadata "instance-name=$INSTANCE_NAME,deployment-time=$(date -u +"%Y-%m-%dT%H:%M:%SZ"),github-actor=${{ github.actor }},auto-delete-hours=${{ github.event.inputs.auto_delete }}"
 
     - name: 🔥 Create firewall rules
       run: |
@@ -465,20 +582,20 @@ jobs:
           --priority=1000 \
           --network=default \
           --action=ALLOW \
-          --rules=tcp:8069 \
+          --rules=tcp:8069,tcp:8072 \
           --source-ranges=0.0.0.0/0 \
           --target-tags=odoo-server \
-          --description="Allow Odoo access on port 8069" || \
+          --description="Allow Odoo access on ports 8069 and 8072" 2>/dev/null || \
         gcloud compute firewall-rules create allow-odoo \
           --project=${{ env.PROJECT_ID }} \
           --direction=INGRESS \
           --priority=1000 \
           --network=default \
           --action=ALLOW \
-          --rules=tcp:8069 \
+          --rules=tcp:8069,tcp:8072 \
           --source-ranges=0.0.0.0/0 \
           --target-tags=odoo-server \
-          --description="Allow Odoo access on port 8069" || echo "Firewall rule already exists"
+          --description="Allow Odoo access on ports 8069 and 8072" 2>/dev/null || echo "Firewall rule already exists"
         
         # Regla para SSH (si no existe)
         gcloud compute firewall-rules create allow-ssh \
@@ -490,21 +607,87 @@ jobs:
           --rules=tcp:22 \
           --source-ranges=0.0.0.0/0 \
           --target-tags=odoo-server \
-          --description="Allow SSH access" || echo "SSH firewall rule already exists"
+          --description="Allow SSH access" 2>/dev/null || echo "SSH firewall rule already exists"
 
-    - name: 📊 Get instance details
+    - name: ⏱️ Wait for instance startup
       run: |
         INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
-        echo "🎉 Instancia creada exitosamente!"
+        
+        echo "⏳ Esperando que la instancia esté lista..."
+        
+        # Esperar a que la instancia esté corriendo
+        for i in {1..60}; do
+          STATUS=$(gcloud compute instances describe $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --format="get(status)")
+          if [[ "$STATUS" == "RUNNING" ]]; then
+            echo "✅ Instancia está corriendo"
+            break
+          fi
+          echo "⏳ Esperando... ($i/60) - Estado: $STATUS"
+          sleep 5
+        done
+        
+        # Esperar a que SSH esté disponible
+        echo "🔗 Verificando conectividad SSH..."
+        EXTERNAL_IP=$(gcloud compute instances describe $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
+        
+        for i in {1..30}; do
+          if gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command="echo 'SSH OK'" --ssh-flag="-o ConnectTimeout=10" &>/dev/null; then
+            echo "✅ SSH está disponible"
+            break
+          fi
+          echo "⏳ Esperando SSH... ($i/30)"
+          sleep 10
+        done
+
+    - name: 🔍 Monitor installation progress
+      run: |
+        INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
+        
+        echo "📊 Monitoreando progreso de la instalación..."
+        
+        # Monitorear por 15 minutos máximo
+        for i in {1..30}; do
+          echo "🔍 Verificando progreso... ($i/30)"
+          
+          # Verificar si la instalación está completa
+          if gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command="test -f /tmp/odoo-install-status && echo 'COMPLETE'" --ssh-flag="-o ConnectTimeout=10" 2>/dev/null | grep -q "COMPLETE"; then
+            echo "✅ ¡Instalación completada!"
+            
+            # Mostrar información de la instalación
+            echo "📋 Información de la instalación:"
+            gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command="cat /tmp/odoo-install-status" --ssh-flag="-o ConnectTimeout=10" 2>/dev/null || echo "No se pudo obtener información"
+            
+            # Verificar que Odoo esté corriendo
+            if gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command="systemctl is-active odoo" --ssh-flag="-o ConnectTimeout=10" 2>/dev/null | grep -q "active"; then
+              echo "✅ Odoo está activo y funcionando"
+            else
+              echo "⚠️ Odoo podría no estar activo aún"
+            fi
+            
+            break
+          fi
+          
+          # Mostrar progreso del startup script
+          echo "📝 Últimas líneas del log de instalación:"
+          gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command="tail -n 5 /var/log/odoo-install.log 2>/dev/null || echo 'Log no disponible aún'" --ssh-flag="-o ConnectTimeout=10" 2>/dev/null || echo "No se pudo conectar"
+          
+          sleep 30
+        done
+
+    - name: 📊 Get instance details and final status
+      run: |
+        INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
+        
+        echo "🎉 Despliegue completado!"
         echo "📍 Detalles de la instancia:"
         gcloud compute instances describe $INSTANCE_NAME \
           --zone=${{ github.event.inputs.zone }} \
           --format="table(name,status,machineType.basename(),scheduling.preemptible.yesno(yes='Yes',no='No'):label=PREEMPTIBLE,networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP,disks[0].diskSizeGb)"
         
         echo ""
-        echo "🌐 IP Externa:"
+        echo "🌐 Información de conexión:"
         EXTERNAL_IP=$(gcloud compute instances describe $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
-        echo "IP: $EXTERNAL_IP"
+        echo "IP Externa: $EXTERNAL_IP"
         
         echo ""
         echo "🏷️ Información del despliegue:"
@@ -512,23 +695,154 @@ jobs:
         echo "Nombre base: ${{ steps.generate_name.outputs.BASE_NAME }}"
         echo "Desplegado por: ${{ github.actor }}"
         echo "Fecha: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+        echo "Zona: ${{ github.event.inputs.zone }}"
+        echo "Tipo de máquina: ${{ github.event.inputs.machine_type }}"
+        echo "Tamaño de disco: ${{ github.event.inputs.disk_size }}GB"
         
         echo ""
-        echo "🔗 URLs de acceso:"
-        echo "Odoo: http://$EXTERNAL_IP:8069"
+        echo "🔗 URLs y accesos:"
+        echo "Odoo Web: http://$EXTERNAL_IP:8069"
+        echo "Long Polling: http://$EXTERNAL_IP:8072"
         echo "SSH: gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }}"
         
         echo ""
-        echo "⏳ La instalación de Odoo puede tardar entre 5-10 minutos después de que la instancia esté ejecutándose."
         echo "📋 Credenciales por defecto:"
-        echo "  - Database: odoo"
-        echo "  - User: admin"
-        echo "  - Password: admin"
+        echo "  - Master Password: admin123"
+        echo "  - Database: (crear nueva en primer acceso)"
+        echo "  - Usuario inicial: admin"
+        echo "  - Contraseña: (configurar en primer acceso)"
         
         echo ""
-        echo "🗑️ Para eliminar la instancia:"
-        echo "gcloud compute instances delete $INSTANCE_NAME --zone=${{ github.event.inputs.zone }}"
+        echo "🔧 Comandos útiles:"
+        echo "Ver estado: gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command='odoo-info'"
+        echo "Ver logs: gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command='journalctl -u odoo -f'"
+        echo "Reiniciar: gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command='sudo systemctl restart odoo'"
         
         echo ""
-        echo "📋 Para verificar el progreso de la instalación:"
-        echo "gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command='tail -f /var/log/syslog | grep startup-script'"
+        echo "🗑️ Limpieza:"
+        echo "Eliminar instancia: gcloud compute instances delete $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --quiet"
+        echo "Eliminar regla firewall: gcloud compute firewall-rules delete allow-odoo-${{ github.run_number }} --quiet"
+        
+        echo ""
+        echo "📈 Verificación final:"
+        
+        # Verificar estado de la instancia
+        INSTANCE_STATUS=$(gcloud compute instances describe $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --format="get(status)")
+        echo "Estado de la instancia: $INSTANCE_STATUS"
+        
+        # Verificar conectividad HTTP
+        echo "🔍 Verificando conectividad HTTP..."
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 http://$EXTERNAL_IP:8069 || echo "000")
+        if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "303" ]]; then
+          echo "✅ Odoo está respondiendo (HTTP $HTTP_STATUS)"
+        else
+          echo "⚠️ Odoo no responde aún (HTTP $HTTP_STATUS) - Podría estar iniciando"
+        fi
+        
+        # Verificar logs de instalación
+        echo "📝 Estado de la instalación:"
+        gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command="if [ -f /tmp/odoo-install-status ]; then echo '✅ Instalación completada'; cat /tmp/odoo-install-status; else echo '⚠️ Instalación en progreso o fallida'; fi" --ssh-flag="-o ConnectTimeout=10" 2>/dev/null || echo "No se pudo verificar el estado"
+        
+        echo ""
+        echo "🚀 ¡Despliegue finalizado!"
+        echo "⏰ Nota: Si Odoo no responde inmediatamente, espera 2-3 minutos adicionales para que termine de iniciar."
+
+    - name: 🕐 Setup auto-deletion (if requested)
+      if: ${{ github.event.inputs.auto_delete != '0' }}
+      run: |
+        INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
+        AUTO_DELETE_HOURS="${{ github.event.inputs.auto_delete }}"
+        
+        echo "⏰ Configurando auto-eliminación en $AUTO_DELETE_HOURS horas..."
+        
+        # Calcular tiempo de eliminación
+        DELETE_TIME=$(date -d "+$AUTO_DELETE_HOURS hours" -u +"%Y-%m-%dT%H:%M:%SZ")
+        
+        # Crear script de auto-eliminación
+        cat > /tmp/auto_delete.sh << EOF
+        #!/bin/bash
+        echo "🗑️ Eliminación automática programada para: $DELETE_TIME"
+        echo "Instancia: $INSTANCE_NAME"
+        echo "Zona: ${{ github.event.inputs.zone }}"
+        
+        # Esperar hasta el tiempo programado
+        while true; do
+          CURRENT_TIME=\$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          if [[ "\$CURRENT_TIME" > "$DELETE_TIME" ]]; then
+            echo "🗑️ Tiempo de eliminación alcanzado, eliminando instancia..."
+            gcloud compute instances delete $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --quiet
+            gcloud compute firewall-rules delete allow-odoo-${{ github.run_number }} --quiet 2>/dev/null || true
+            echo "✅ Instancia eliminada automáticamente"
+            break
+          fi
+          sleep 300  # Verificar cada 5 minutos
+        done
+        EOF
+        
+        chmod +x /tmp/auto_delete.sh
+        
+        # Copiar script a la instancia y ejecutar en background
+        gcloud compute scp /tmp/auto_delete.sh $INSTANCE_NAME:/tmp/auto_delete.sh --zone=${{ github.event.inputs.zone }}
+        gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --command="nohup /tmp/auto_delete.sh > /tmp/auto_delete.log 2>&1 &"
+        
+        echo "✅ Auto-eliminación configurada para $DELETE_TIME"
+        echo "📋 La instancia se eliminará automáticamente en $AUTO_DELETE_HOURS horas"
+
+    - name: 📊 Create deployment summary
+      run: |
+        INSTANCE_NAME="${{ steps.generate_name.outputs.INSTANCE_NAME }}"
+        EXTERNAL_IP=$(gcloud compute instances describe $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
+        
+        echo "## 🚀 Resumen del Despliegue de Odoo 18" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Información General" >> $GITHUB_STEP_SUMMARY
+        echo "| Campo | Valor |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Instancia** | \`$INSTANCE_NAME\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **IP Externa** | \`$EXTERNAL_IP\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Zona** | \`${{ github.event.inputs.zone }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Tipo de Máquina** | \`${{ github.event.inputs.machine_type }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Tamaño de Disco** | \`${{ github.event.inputs.disk_size }}GB\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Desplegado por** | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Fecha** | \`$(date -u +"%Y-%m-%d %H:%M:%S UTC")\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔗 Accesos" >> $GITHUB_STEP_SUMMARY
+        echo "- **Odoo Web Interface**: [http://$EXTERNAL_IP:8069](http://$EXTERNAL_IP:8069)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Long Polling**: [http://$EXTERNAL_IP:8072](http://$EXTERNAL_IP:8072)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔑 Credenciales" >> $GITHUB_STEP_SUMMARY
+        echo "- **Master Password**: \`admin123\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Database**: Crear nueva en primer acceso" >> $GITHUB_STEP_SUMMARY
+        echo "- **Usuario Admin**: \`admin\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Contraseña**: Configurar en primer acceso" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🛠️ Comandos Útiles" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "# Conectar por SSH" >> $GITHUB_STEP_SUMMARY
+        echo "gcloud compute ssh $INSTANCE_NAME --zone=${{ github.event.inputs.zone }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# Ver información del sistema" >> $GITHUB_STEP_SUMMARY
+        echo "odoo-info" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# Ver logs de Odoo" >> $GITHUB_STEP_SUMMARY
+        echo "journalctl -u odoo -f" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# Reiniciar Odoo" >> $GITHUB_STEP_SUMMARY
+        echo "sudo systemctl restart odoo" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# Eliminar instancia" >> $GITHUB_STEP_SUMMARY
+        echo "gcloud compute instances delete $INSTANCE_NAME --zone=${{ github.event.inputs.zone }} --quiet" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [[ "${{ github.event.inputs.auto_delete }}" != "0" ]]; then
+          echo "### ⏰ Auto-eliminación" >> $GITHUB_STEP_SUMMARY
+          echo "La instancia se eliminará automáticamente en **${{ github.event.inputs.auto_delete }} horas**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "### 📌 Notas Importantes" >> $GITHUB_STEP_SUMMARY
+        echo "- ⏰ Odoo puede tardar 2-3 minutos adicionales en estar completamente disponible" >> $GITHUB_STEP_SUMMARY
+        echo "- 🔒 Cambia la contraseña maestra en producción" >> $GITHUB_STEP_SUMMARY
+        echo "- 📊 Monitorea el uso de recursos según tu carga de trabajo" >> $GITHUB_STEP_SUMMARY
+        echo "- 🔧 Personaliza la configuración según tus necesidades" >> $GITHUB_STEP_SUMMARY
+        
+        echo "✅ Resumen del despliegue creado en el tab 'Summary' del workflow"
